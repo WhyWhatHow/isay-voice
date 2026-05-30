@@ -1,0 +1,72 @@
+name: Dev Build (Linux)
+
+# 手动触发 + push 到 custom 分支自动构建，产出 Linux 静态 binary + AppImage
+# 产物上传为 artifact 可直接下载本地测试
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ['custom/**']
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-22.04
+    defaults:
+      run:
+        working-directory: openless-all/app
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: openless-all/app/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'openless-all/app/src-tauri -> target'
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            file \
+            libasound2-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libssl-dev \
+            libwebkit2gtk-4.1-dev \
+            libxdo-dev \
+            wget
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Verify Rust backend compiles
+        run: cargo check --manifest-path src-tauri/Cargo.toml
+
+      - name: Build Tauri app (Linux)
+        run: npx tauri build --bundles deb,appimage
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: openless-linux-dev
+          path: |
+            openless-all/app/src-tauri/target/release/bundle/deb/*.deb
+            openless-all/app/src-tauri/target/release/bundle/appimage/*.AppImage
+          retention-days: 7
