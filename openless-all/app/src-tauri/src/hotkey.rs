@@ -8,7 +8,7 @@
 //!
 //! 仅产出"边沿"事件，toggle vs hold 由 Coordinator 解释。
 
-use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -722,7 +722,7 @@ mod platform {
     mod tests {
         use super::*;
         use parking_lot::RwLock;
-        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::mpsc;
 
         fn shared(trigger: HotkeyTrigger) -> Arc<Shared> {
@@ -1160,7 +1160,7 @@ mod platform {
     mod tests {
         use super::*;
         use parking_lot::RwLock;
-        use std::sync::atomic::{AtomicBool, AtomicU32};
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
         use std::sync::mpsc;
 
         fn shared(trigger: HotkeyTrigger) -> Arc<Shared> {
