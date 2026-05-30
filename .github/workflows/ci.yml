@@ -8,7 +8,7 @@ name: CI
 
 on:
   push:
-    branches: [main, beta]
+    branches: [main, beta, custom/aimodel]
   pull_request:
     branches: [main, beta]
 
