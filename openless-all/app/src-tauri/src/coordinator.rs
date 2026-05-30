@@ -804,7 +804,8 @@ impl Coordinator {
         };
         if dictation_trigger.is_some() {
             take_combo_hotkey_on_main_thread(&self.inner);
-        } else {
+        } else if !is_pure_modifier_combo {
+            // 纯修饰键组合（Ctrl+Win）走 modifier-only 路径，不需要 combo 注册
             self.update_combo_hotkey_binding();
         }
         self.ensure_modifier_hotkey_monitor(binding);
@@ -2763,11 +2764,11 @@ fn read_whisper_credentials() -> (Vec<String>, String, String) {
         .ok()
         .flatten()
         .unwrap_or_default();
-    // 複数の API キーを改行区切りで格納できる。
-    // １行に１つのキー。空白行はスキップ。
+    // 複数の API キーをカンマ区切りで格納できる。
+    // 例: "sk-aaa, sk-bbb, sk-ccc"
     let api_keys: Vec<String> = api_key
-        .lines()
-        .map(|line| line.trim().to_string())
+        .split(',')
+        .map(|s| s.trim().to_string())
         .filter(|k| !k.is_empty())
         .collect();
     let api_keys = if api_keys.is_empty() {

@@ -19,6 +19,18 @@ pub fn validate_binding(binding: &ShortcutBinding) -> Result<(), ShortcutBinding
     if binding.modifiers.is_empty() && binding.primary.eq_ignore_ascii_case("shift") {
         return Ok(());
     }
+    // マルチ修飾キーのみの組み合わせ（例: Ctrl+Win）を許可。
+    // プライマリキーが空で、修飾キーが 2 つ以上ある場合は有効。
+    if binding.primary.trim().is_empty() && binding.modifiers.len() >= 2 {
+        // 各修飾キーが既知のものかチェック
+        for m in &binding.modifiers {
+            let tag = normalize_modifier_tag(m);
+            if !matches!(tag.as_str(), "cmd" | "command" | "super" | "meta" | "win" | "ctrl" | "control" | "alt" | "option" | "opt" | "shift") {
+                return Err(ShortcutBindingError::UnsupportedModifier(m.clone()));
+            }
+        }
+        return Ok(());
+    }
     parse_global_hotkey(binding)?;
     Ok(())
 }
