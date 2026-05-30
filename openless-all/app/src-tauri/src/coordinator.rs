@@ -784,10 +784,23 @@ impl Coordinator {
         let prefs = self.inner.prefs.get();
         let dictation_trigger =
             crate::shortcut_binding::legacy_modifier_trigger(&prefs.dictation_hotkey);
+        // マルチトリガー（例: Ctrl+Win、プライマリキー無し）のキー一覧を
+        // HotkeyBinding.keys に渡す。プライマリキーがある場合（Ctrl+Win+F1 等）は
+        // コンボパスが処理するので keys は None のままにする。
+        let is_pure_modifier_combo = dictation_trigger.is_none()
+            && prefs.dictation_hotkey.primary.trim().is_empty()
+            && !prefs.dictation_hotkey.modifiers.is_empty();
+        let keys = if is_pure_modifier_combo {
+            Some(prefs.dictation_hotkey.modifiers.iter().map(|m| {
+                crate::types::HotkeyKey { code: m.clone() }
+            }).collect())
+        } else {
+            None
+        };
         let binding = crate::types::HotkeyBinding {
             trigger: dictation_trigger.unwrap_or(crate::types::HotkeyTrigger::Custom),
             mode: prefs.hotkey.mode,
-            keys: None,
+            keys,
         };
         if dictation_trigger.is_some() {
             take_combo_hotkey_on_main_thread(&self.inner);
@@ -2089,7 +2102,7 @@ fn should_try_non_tsf_insertion_fallback(
 }
 
 #[cfg(target_os = "windows")]
-fn insert_via_non_tsf_fallback(
+pub(super) fn insert_via_non_tsf_fallback(
     inner: &Arc<Inner>,
     polished: &str,
     _restore_clipboard: bool,
@@ -2745,11 +2758,23 @@ async fn translate_text(
         .await?)
 }
 
-fn read_whisper_credentials() -> (String, String, String) {
+fn read_whisper_credentials() -> (Vec<String>, String, String) {
     let api_key = CredentialsVault::get(CredentialAccount::AsrApiKey)
         .ok()
         .flatten()
         .unwrap_or_default();
+    // 複数の API キーを改行区切りで格納できる。
+    // １行に１つのキー。空白行はスキップ。
+    let api_keys: Vec<String> = api_key
+        .lines()
+        .map(|line| line.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .collect();
+    let api_keys = if api_keys.is_empty() {
+        vec![String::new()]  // 空文字で初期化 → transcribe_inner でエラー
+    } else {
+        api_keys
+    };
     let base_url = CredentialsVault::get(CredentialAccount::AsrEndpoint)
         .ok()
         .flatten()
@@ -2759,7 +2784,7 @@ fn read_whisper_credentials() -> (String, String, String) {
         .flatten()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "whisper-1".to_string());
-    (api_key, base_url, model)
+    (api_keys, base_url, model)
 }
 
 fn read_bailian_credentials() -> BailianCredentials {

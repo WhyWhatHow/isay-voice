@@ -21,8 +21,78 @@ pub const PROMPT_CHAR_BUDGET: usize = 240;
 /// 区切り文字（ASCII）。Whisper のトークナイザはどの言語でも安定して扱える。
 const PROMPT_SEPARATOR: &str = ", ";
 
+/// 複数の API キーを管理し、ラウンドロビン・フォールバックで使い分ける。
+///
+/// １つのキーでリクエストが失敗した場合、自動的に次のキーで再試行する。
+/// 全てのキーが失敗した場合は最後のエラーをそのまま返す。
+///
+/// # 例
+///
+/// ```
+/// let ring = KeyRing::new(vec!["sk-aaa".into(), "sk-bbb".into()]);
+/// let key = ring.next();                     // "sk-aaa"
+/// ring.mark_failed("sk-aaa");
+/// let key = ring.next();                     // "sk-bbb"
+/// ring.mark_success("sk-bbb");
+/// ```
+pub struct KeyRing {
+    keys: Vec<KeyEntry>,
+    current: usize,
+}
+
+struct KeyEntry {
+    key: String,
+    consecutive_failures: usize,
+}
+
+impl KeyRing {
+    pub fn new(keys: Vec<String>) -> Self {
+        assert!(!keys.is_empty(), "KeyRing needs at least one key");
+        Self {
+            keys: keys.into_iter().map(|k| KeyEntry { key: k, consecutive_failures: 0 }).collect(),
+            current: 0,
+        }
+    }
+
+    /// 現在のキーを返す（排他制御は呼び出し側で行うこと）。
+    pub fn current_key(&self) -> &str {
+        &self.keys[self.current].key
+    }
+
+    /// 次のキーに進む。全てのキーが失敗した場合は最後のキーに留まる。
+    pub fn advance(&mut self) -> &str {
+        let len = self.keys.len();
+        if len == 1 {
+            return &self.keys[0].key;
+        }
+        self.current = (self.current + 1) % len;
+        &self.keys[self.current].key
+    }
+
+    /// 成功を報告：連続失敗カウンタをリセット。
+    pub fn mark_success(&mut self) {
+        if let Some(entry) = self.keys.get_mut(self.current) {
+            entry.consecutive_failures = 0;
+        }
+    }
+
+    /// 失敗を報告：全て失敗したかどうかを返す。
+    /// 全て失敗 → caller は諦めて最後のエラーを返すべき。
+    pub fn mark_failed(&mut self) -> bool {
+        let all_failed = self.keys.iter().all(|e| e.consecutive_failures >= 1);
+        if let Some(entry) = self.keys.get_mut(self.current) {
+            entry.consecutive_failures += 1;
+        }
+        all_failed
+    }
+
+    pub fn len(&self) -> usize {
+        self.keys.len()
+    }
+}
+
 pub struct WhisperBatchASR {
-    api_key: String,
+    key_ring: Mutex<KeyRing>,
     base_url: String,
     model: String,
     /// 任意のプロンプト（語彙ヒント等）。空文字や空白のみは送信しない。
@@ -42,7 +112,25 @@ impl WhisperBatchASR {
         max_chunk_duration_ms: Option<u64>,
     ) -> Self {
         Self {
-            api_key,
+            key_ring: Mutex::new(KeyRing::new(vec![api_key])),
+            base_url,
+            model,
+            prompt,
+            max_chunk_duration_ms,
+            buffer: Mutex::new(Vec::new()),
+        }
+    }
+
+    /// 複数の API キーで初期化する。keys は少なくとも 1 つ必要。
+    pub fn with_keys(
+        keys: Vec<String>,
+        base_url: String,
+        model: String,
+        prompt: Option<String>,
+        max_chunk_duration_ms: Option<u64>,
+    ) -> Self {
+        Self {
+            key_ring: Mutex::new(KeyRing::new(keys)),
             base_url,
             model,
             prompt,
@@ -77,16 +165,39 @@ impl WhisperBatchASR {
     }
 
     async fn transcribe_inner(&self, pcm: &[u8]) -> Result<RawTranscript> {
-        if self.api_key.is_empty() {
-            anyhow::bail!("Whisper API key missing");
-        }
-
         let duration_ms = pcm_duration_ms(pcm);
         let chunks = split_pcm_by_duration(pcm, self.max_chunk_duration_ms);
         let mut texts = Vec::with_capacity(chunks.len());
 
+        // 各 chunk を逐次処理。chunk の処理に失敗した場合、次のキーで再試行。
         for chunk in chunks {
-            texts.push(self.transcribe_chunk(chunk).await?);
+            // 同じ chunk を最大でキー数回までリトライ
+            let max_attempts = self.key_ring.lock().len();
+            let mut last_error = None;
+            for _ in 0..max_attempts {
+                match self.transcribe_chunk(chunk).await {
+                    Ok(text) => {
+                        self.key_ring.lock().mark_success();
+                        texts.push(text);
+                        last_error = None;
+                        break;
+                    }
+                    Err(e) => {
+                        let all_failed = self.key_ring.lock().mark_failed();
+                        if all_failed {
+                            // 全キー失敗 → 最後のエラーを返す
+                            last_error = Some(e);
+                            break;
+                        }
+                        // 次のキーでリトライ
+                        self.key_ring.lock().advance();
+                        last_error = Some(e);
+                    }
+                }
+            }
+            if let Some(err) = last_error {
+                return Err(err).context("all API keys failed for whisper chunk");
+            }
         }
 
         Ok(RawTranscript {
@@ -122,9 +233,10 @@ impl WhisperBatchASR {
         }
 
         let client = reqwest::Client::new();
+        let api_key = self.key_ring.lock().current_key().to_string();
         let resp = client
             .post(&url)
-            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Authorization", format!("Bearer {}", api_key))
             .multipart(form)
             .send()
             .await

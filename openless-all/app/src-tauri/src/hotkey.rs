@@ -8,7 +8,7 @@
 //!
 //! 仅产出"边沿"事件，toggle vs hold 由 Coordinator 解释。
 
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::mpsc::{self, Sender};
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +37,9 @@ mod tests {
     fn shared_with_held_latches() -> Shared {
         Shared {
             binding: RwLock::new(HotkeyBinding::default()),
-            trigger_held: AtomicBool::new(true),
+            trigger_held: AtomicU32::new(1),
+            trigger_threshold: RwLock::new(1),
+            trigger_vk_codes: RwLock::new(Vec::new()),
             qa_trigger: RwLock::new(None),
             qa_trigger_held: AtomicBool::new(true),
             translation_trigger: RwLock::new(None),
@@ -51,7 +53,7 @@ mod tests {
         let shared = shared_with_held_latches();
         reset_shared_held_state(&shared);
 
-        assert!(!shared.trigger_held.load(Ordering::SeqCst));
+        assert_eq!(shared.trigger_held.load(Ordering::SeqCst), 0);
         assert!(!shared.qa_trigger_held.load(Ordering::SeqCst));
         assert!(!shared.translation_trigger_held.load(Ordering::SeqCst));
         assert!(!shared.translation_modifier_held.load(Ordering::SeqCst));
@@ -69,7 +71,7 @@ mod tests {
         update_shared_binding(&shared, next.clone());
 
         assert_eq!(*shared.binding.read(), next);
-        assert!(!shared.trigger_held.load(Ordering::SeqCst));
+        assert_eq!(shared.trigger_held.load(Ordering::SeqCst), 0);
         assert!(shared.qa_trigger_held.load(Ordering::SeqCst));
         assert!(shared.translation_trigger_held.load(Ordering::SeqCst));
         assert!(shared.translation_modifier_held.load(Ordering::SeqCst));
@@ -111,8 +113,16 @@ pub trait HotkeyAdapter: Send + Sync {
 
 struct Shared {
     binding: RwLock<HotkeyBinding>,
-    /// 触发键当前是否处于"按住"状态。OS 自动重复事件用此去重。
-    trigger_held: AtomicBool,
+    /// トリガーキーが何個押されているかのカウンタ（マルチキー＆単一キー両対応）。
+    /// 単一キーなら threshold=1、マルチキー（例: Ctrl+Win）なら threshold=2。
+    /// カウンタが 0 → threshold になった時点で Pressed,
+    /// threshold → 0 になった時点で Released を発行する。
+    trigger_held: AtomicU32,
+    trigger_threshold: RwLock<u32>,
+    /// マルチトリガー用の VK コード一覧。単一キー時は空。
+    trigger_vk_codes: RwLock<Vec<u32>>,
+    /// macOS 用：マルチトリガーの CGEventFlags マスク。単一キー時は 0。
+    trigger_flags: RwLock<u64>,
     qa_trigger: RwLock<Option<HotkeyTrigger>>,
     qa_trigger_held: AtomicBool,
     translation_trigger: RwLock<Option<HotkeyTrigger>>,
@@ -204,7 +214,10 @@ where
 {
     let shared = Arc::new(Shared {
         binding: RwLock::new(binding),
-        trigger_held: AtomicBool::new(false),
+        trigger_held: AtomicU32::new(0),
+        trigger_threshold: RwLock::new(1),
+        trigger_vk_codes: RwLock::new(Vec::new()),
+        trigger_flags: RwLock::new(0),
         qa_trigger: RwLock::new(None),
         qa_trigger_held: AtomicBool::new(false),
         translation_trigger: RwLock::new(None),
@@ -226,11 +239,66 @@ where
     }
 }
 
+/// VK コード定数（module レベル resolve_vk_codes で使用）
+const VK_LSHIFT: u32 = 0xA0;
+const VK_RSHIFT: u32 = 0xA1;
+const VK_LCONTROL: u32 = 0xA2;
+const VK_RCONTROL: u32 = 0xA3;
+const VK_LMENU: u32 = 0xA4;
+const VK_RMENU: u32 = 0xA5;
+const VK_LWIN: u32 = 0x5B;
+const VK_RWIN: u32 = 0x5C;
+
+/// macOS CGEventFlags 定数（macOS コンパイル時のみ参照される）
+const MAC_FLAG_CONTROL: u64 = 0x0004_0000;
+const MAC_FLAG_ALTERNATE: u64 = 0x0008_0000;
+const MAC_FLAG_COMMAND: u64 = 0x0010_0000;
+const MAC_FLAG_SHIFT: u64 = 0x0002_0000;
+
+fn resolve_vk_codes(keys: &[String]) -> Vec<u32> {
+    keys.iter().map(|k| match k.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" | "leftctrl" | "leftcontrol" => VK_LCONTROL,
+        "rightctrl" | "rightcontrol" => VK_RCONTROL,
+        "win" | "meta" | "super" | "cmd" | "command" | "leftwin" => VK_LWIN,
+        "rightwin" | "rightcmd" | "rightcommand" => VK_RWIN,
+        "alt" | "option" | "leftalt" | "leftoption" => VK_LMENU,
+        "rightalt" | "rightoption" => VK_RMENU,
+        "shift" | "leftshift" => VK_LSHIFT,
+        "rightshift" => VK_RSHIFT,
+        _ => 0,
+    }).filter(|code| *code != 0).collect()
+}
+
+/// macOS 用：キー名から CGEventFlags のビットマスクを計算する。
+fn resolve_cg_flags(keys: &[String]) -> u64 {
+    keys.iter().fold(0u64, |mask, k| {
+        mask | match k.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "leftctrl" | "rightctrl" => MAC_FLAG_CONTROL,
+            "cmd" | "command" | "super" | "meta" | "win" | "leftwin" | "rightwin" => MAC_FLAG_COMMAND,
+            "alt" | "option" | "opt" | "leftalt" | "rightalt" | "leftoption" | "rightoption" => MAC_FLAG_ALTERNATE,
+            "shift" | "leftshift" | "rightshift" => MAC_FLAG_SHIFT,
+            _ => 0,
+        }
+    })
+}
+
 fn update_shared_binding(shared: &Shared, binding: HotkeyBinding) {
-    *shared.binding.write() = binding;
-    shared
-        .trigger_held
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    *shared.binding.write() = binding.clone();
+    if binding.trigger == HotkeyTrigger::Custom {
+        let codes = binding.keys
+            .as_ref()
+            .map(|keys| keys.iter().map(|k| k.code.clone()).collect::<Vec<_>>())
+            .unwrap_or_default();
+        let vk_codes = resolve_vk_codes(&codes);
+        *shared.trigger_vk_codes.write() = vk_codes.clone();
+        *shared.trigger_threshold.write() = vk_codes.len() as u32;
+        *shared.trigger_flags.write() = resolve_cg_flags(&codes);
+    } else {
+        *shared.trigger_vk_codes.write() = Vec::new();
+        *shared.trigger_threshold.write() = 1;
+        *shared.trigger_flags.write() = 0;
+    }
+    shared.trigger_held.store(0, Ordering::SeqCst);
 }
 
 fn update_shared_modifier_shortcuts(
@@ -251,7 +319,7 @@ fn update_shared_modifier_shortcuts(
 fn reset_shared_held_state(shared: &Shared) {
     shared
         .trigger_held
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+        .store(0, std::sync::atomic::Ordering::SeqCst);
     shared
         .qa_trigger_held
         .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -563,6 +631,19 @@ mod platform {
 
         let trigger = ctx.shared.binding.read().trigger;
         if trigger == HotkeyTrigger::Custom {
+            // マルチトリガー（例: Ctrl+Win）→ フラグマスクで判定
+            let mask = *ctx.shared.trigger_flags.read();
+            if mask != 0 {
+                let is_active = (flags & mask) == mask;
+                let was_held = ctx.shared.trigger_held.load(Ordering::SeqCst);
+                if is_active && was_held == 0 {
+                    ctx.shared.trigger_held.store(1, Ordering::SeqCst);
+                    send_or_log(&ctx.tx, HotkeyEvent::Pressed);
+                } else if !is_active && was_held == 1 {
+                    ctx.shared.trigger_held.store(0, Ordering::SeqCst);
+                    send_or_log(&ctx.tx, HotkeyEvent::Released);
+                }
+            }
             return;
         }
         let expected_keycode = trigger_to_keycode(trigger);
@@ -573,11 +654,11 @@ mod platform {
         let is_active = (flags & mask) != 0;
         let was_held = ctx.shared.trigger_held.load(Ordering::SeqCst);
 
-        if is_active && !was_held {
-            ctx.shared.trigger_held.store(true, Ordering::SeqCst);
+        if is_active && was_held == 0 {
+            ctx.shared.trigger_held.store(1, Ordering::SeqCst);
             send_or_log(&ctx.tx, HotkeyEvent::Pressed);
-        } else if !is_active && was_held {
-            ctx.shared.trigger_held.store(false, Ordering::SeqCst);
+        } else if !is_active && was_held == 1 {
+            ctx.shared.trigger_held.store(0, Ordering::SeqCst);
             send_or_log(&ctx.tx, HotkeyEvent::Released);
         }
     }
@@ -641,7 +722,7 @@ mod platform {
     mod tests {
         use super::*;
         use parking_lot::RwLock;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicU32};
         use std::sync::mpsc;
 
         fn shared(trigger: HotkeyTrigger) -> Arc<Shared> {
@@ -651,7 +732,10 @@ mod platform {
                     mode: crate::types::HotkeyMode::Toggle,
                     keys: None,
                 }),
-                trigger_held: AtomicBool::new(false),
+                trigger_held: AtomicU32::new(0),
+                trigger_threshold: RwLock::new(1),
+                trigger_vk_codes: RwLock::new(Vec::new()),
+                trigger_flags: RwLock::new(0),
                 qa_trigger: RwLock::new(None),
                 qa_trigger_held: AtomicBool::new(false),
                 translation_trigger: RwLock::new(None),
@@ -959,6 +1043,13 @@ mod platform {
 
         let trigger = ctx.shared.binding.read().trigger;
         if trigger == HotkeyTrigger::Custom {
+            // マルチキー（例: Ctrl+Win）→ VK コード一覧と照合してカウンタを更新。
+            let vk_codes = ctx.shared.trigger_vk_codes.read();
+            if !vk_codes.is_empty() {
+                let threshold = *ctx.shared.trigger_threshold.read();
+                return handle_multi_modifier_event(ctx, vk_code, message, &vk_codes, threshold);
+            }
+            // 従来の Custom: combo_hotkey に任せる。
             return false;
         }
         if vk_code != trigger_to_vk_code(trigger) {
@@ -967,15 +1058,15 @@ mod platform {
 
         match message {
             WM_KEYDOWN | WM_SYSKEYDOWN => {
-                let was_held = ctx.shared.trigger_held.swap(true, Ordering::SeqCst);
-                if !was_held {
+                let prev = ctx.shared.trigger_held.fetch_add(1, Ordering::SeqCst);
+                if prev == 0 {
                     log::info!("[hotkey] Windows trigger pressed vk={vk_code}");
                     send_or_log(&ctx.tx, HotkeyEvent::Pressed);
                 }
             }
             WM_KEYUP | WM_SYSKEYUP => {
-                let was_held = ctx.shared.trigger_held.swap(false, Ordering::SeqCst);
-                if was_held {
+                let prev = ctx.shared.trigger_held.fetch_sub(1, Ordering::SeqCst);
+                if prev == 1 {
                     log::info!("[hotkey] Windows trigger released vk={vk_code}");
                     send_or_log(&ctx.tx, HotkeyEvent::Released);
                 }
@@ -1028,6 +1119,39 @@ mod platform {
         }
     }
 
+    /// マルチトリガーイベントを処理する。counter ベース。
+    /// threshold 個のキーが全て押された → Pressed。
+    /// 1 つでも離された → Released。
+    fn handle_multi_modifier_event(
+        ctx: &CallbackContext,
+        vk_code: u32,
+        message: usize,
+        vk_codes: &[u32],
+        threshold: u32,
+    ) -> bool {
+        if threshold == 0 || !vk_codes.contains(&vk_code) {
+            return false;
+        }
+        match message {
+            WM_KEYDOWN | WM_SYSKEYDOWN => {
+                let prev = ctx.shared.trigger_held.fetch_add(1, Ordering::SeqCst);
+                log::info!("[hotkey] multi-mod keydown vk={vk_code} count={} threshold={}", prev + 1, threshold);
+                if prev + 1 == threshold {
+                    send_or_log(&ctx.tx, HotkeyEvent::Pressed);
+                }
+            }
+            WM_KEYUP | WM_SYSKEYUP => {
+                let prev = ctx.shared.trigger_held.fetch_sub(1, Ordering::SeqCst);
+                log::info!("[hotkey] multi-mod keyup vk={vk_code} count={} threshold={}", prev.saturating_sub(1), threshold);
+                if prev == threshold {
+                    send_or_log(&ctx.tx, HotkeyEvent::Released);
+                }
+            }
+            _ => {}
+        }
+        true
+    }
+
     fn accept_injected_events() -> bool {
         std::env::var(ACCEPT_INJECTED_ENV).ok().as_deref() == Some("1")
     }
@@ -1036,7 +1160,7 @@ mod platform {
     mod tests {
         use super::*;
         use parking_lot::RwLock;
-        use std::sync::atomic::AtomicBool;
+        use std::sync::atomic::{AtomicBool, AtomicU32};
         use std::sync::mpsc;
 
         fn shared(trigger: HotkeyTrigger) -> Arc<Shared> {
@@ -1046,7 +1170,10 @@ mod platform {
                     mode: crate::types::HotkeyMode::Toggle,
                     keys: None,
                 }),
-                trigger_held: AtomicBool::new(false),
+                trigger_held: AtomicU32::new(0),
+                trigger_threshold: RwLock::new(1),
+                trigger_vk_codes: RwLock::new(Vec::new()),
+                trigger_flags: RwLock::new(0),
                 qa_trigger: RwLock::new(None),
                 qa_trigger_held: AtomicBool::new(false),
                 translation_trigger: RwLock::new(None),

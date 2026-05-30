@@ -787,7 +787,7 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
         log::info!("[coord] Bailian ASR connected; flushed {flushed_bytes} deferred audio bytes");
         finish_starting_session(inner, current_session_id).await;
     } else if is_whisper_compatible_provider(&active_asr) {
-        let (api_key, base_url, model) = read_whisper_credentials();
+        let (api_keys, base_url, model) = read_whisper_credentials();
         // 用户辞書の有効フレーズを Whisper の `prompt` に流し込む。固有名詞や
         // 専門用語の同音・近形誤認識を ASR 段階で抑える。Polish LLM 側には
         // 既に system prompt として注入済みだが、Whisper 出力が大きく崩れる
@@ -797,13 +797,23 @@ pub(super) async fn begin_session(inner: &Arc<Inner>) -> Result<(), String> {
         // 互換プロバイダにも揃えるのが筋。
         let whisper_prompt =
             crate::asr::whisper::build_prompt_from_phrases(&enabled_phrases(inner));
-        let whisper = Arc::new(WhisperBatchASR::new(
-            api_key,
-            base_url,
-            model,
-            whisper_prompt,
-            batch_asr_chunk_limit_ms(&active_asr),
-        ));
+        let whisper = if api_keys.len() > 1 {
+            Arc::new(WhisperBatchASR::with_keys(
+                api_keys,
+                base_url,
+                model,
+                whisper_prompt,
+                batch_asr_chunk_limit_ms(&active_asr),
+            ))
+        } else {
+            Arc::new(WhisperBatchASR::new(
+                api_keys.into_iter().next().unwrap_or_default(),
+                base_url,
+                model,
+                whisper_prompt,
+                batch_asr_chunk_limit_ms(&active_asr),
+            ))
+        };
         store_asr_for_session(
             inner,
             current_session_id,
@@ -1685,16 +1695,27 @@ pub(super) async fn end_session(inner: &Arc<Inner>) -> Result<(), String> {
         #[cfg(target_os = "windows")]
         {
             let ime_target = capture_ime_submit_target();
-            insert_with_windows_ime_first(
-                inner,
-                current_session_id,
-                &polished,
-                restore_clipboard,
-                allow_non_tsf_insertion_fallback,
-                paste_shortcut,
-                ime_target,
-            )
-            .await
+            let use_ime = inner.prefs.get().use_system_ime;
+            if use_ime {
+                insert_with_windows_ime_first(
+                    inner,
+                    current_session_id,
+                    &polished,
+                    restore_clipboard,
+                    allow_non_tsf_insertion_fallback,
+                    paste_shortcut,
+                    ime_target,
+                )
+                .await
+            } else {
+                // IME を使わない → 直接 Unicode SendInput + 剪贴板兜底
+                insert_via_non_tsf_fallback(
+                    inner,
+                    &polished,
+                    restore_clipboard,
+                    paste_shortcut,
+                )
+            }
         }
         #[cfg(not(target_os = "windows"))]
         {
